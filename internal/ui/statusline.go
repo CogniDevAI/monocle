@@ -8,7 +8,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -18,17 +17,22 @@ import (
 
 // statuslineModel es el sub-modelo para elegir y aplicar un preset
 // de statusline. Flujo: list de presets → preview + confirm → apply.
-// Si el usuario elige "Custom", el flujo pasa por stepEditCustom (textarea).
+// Si el usuario elige "Custom (armá el tuyo)", el flujo pasa por stepBuild,
+// donde activa/desactiva segments y Monocle genera el script bash.
 type statuslineModel struct {
-	list       list.Model
-	preview    string
-	settings   *settings.Settings
-	width      int
-	height     int
-	step       stepState
-	chosen     *presets.Preset
-	customArea textarea.Model
-	err        error
+	list     list.Model
+	preview  string
+	settings *settings.Settings
+	width    int
+	height   int
+	step     stepState
+	chosen   *presets.Preset
+
+	// stepBuild state
+	segments []segmentItem
+	cursor   int
+
+	err error
 }
 
 type stepState int
@@ -36,15 +40,15 @@ type stepState int
 const (
 	stepPick stepState = iota
 	stepConfirm
-	stepEditCustom
+	stepBuild
 	stepDone
 )
 
-const customPlaceholder = `#!/usr/bin/env bash
-# escribí tu statusline acá
-input=$(cat)
-printf "..."
-`
+// segmentItem envuelve un Segment con su flag enabled para el builder.
+type segmentItem struct {
+	seg     presets.Segment
+	enabled bool
+}
 
 func newStatuslineModel(st *settings.Settings, w, h int) *statuslineModel {
 	all := presets.All()
@@ -54,8 +58,8 @@ func newStatuslineModel(st *settings.Settings, w, h int) *statuslineModel {
 	}
 	items = append(items, presetItem{
 		isCustom:    true,
-		customName:  "Custom (escribir el mío)",
-		customDescr: "abrí un editor y pegá/escribí tu propio script bash",
+		customName:  "Custom (armá el tuyo)",
+		customDescr: "elegí qué segmentos mostrar (folder, rama, modelo, contexto, tokens, etc.)",
 	})
 
 	delegate := list.NewDefaultDelegate()
@@ -84,10 +88,6 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = v.Width, v.Height
 		m.list.SetSize(v.Width-4, v.Height-6)
-		if m.step == stepEditCustom {
-			m.customArea.SetWidth(v.Width - 6)
-			m.customArea.SetHeight(v.Height - 8)
-		}
 
 	case tea.KeyMsg:
 		switch m.step {
@@ -101,9 +101,10 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if it.isCustom {
-					m.customArea = newCustomTextarea(m.width, m.height)
-					m.step = stepEditCustom
-					return m, textarea.Blink
+					m.segments = newSegmentItems()
+					m.cursor = 0
+					m.step = stepBuild
+					return m, nil
 				}
 				body, err := it.preset.Content()
 				if err != nil {
@@ -130,16 +131,31 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				name := m.chosen.Name
 				return m, sendBack(fmt.Sprintf("✓ Statusline aplicado: %s", name))
 			}
-		case stepEditCustom:
-			// En el editor solo `esc` cancela — `q` debe poder escribirse
-			// como parte del script bash sin abortar la edición.
-			if v.String() == "esc" {
+		case stepBuild:
+			if key.Matches(v, backKey) {
 				m.step = stepPick
-				m.customArea.Reset()
+				m.segments = nil
+				m.cursor = 0
 				m.err = nil
 				return m, nil
 			}
-			if key.Matches(v, saveKey) {
+			switch {
+			case key.Matches(v, upKey):
+				if m.cursor > 0 {
+					m.cursor--
+				}
+				return m, nil
+			case key.Matches(v, downKey):
+				if m.cursor < len(m.segments)-1 {
+					m.cursor++
+				}
+				return m, nil
+			case key.Matches(v, toggleKey):
+				if m.cursor >= 0 && m.cursor < len(m.segments) {
+					m.segments[m.cursor].enabled = !m.segments[m.cursor].enabled
+				}
+				return m, nil
+			case key.Matches(v, saveKey):
 				path, err := m.applyCustom()
 				if err != nil {
 					m.err = err
@@ -147,22 +163,14 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, sendBack(fmt.Sprintf("✓ Statusline custom aplicado en %s", path))
 			}
-			var cmd tea.Cmd
-			m.customArea, cmd = m.customArea.Update(msg)
-			return m, cmd
 		case stepDone:
 			return m, sendBack("")
 		}
 	}
 
-	switch m.step {
-	case stepPick:
+	if m.step == stepPick {
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
-		return m, cmd
-	case stepEditCustom:
-		var cmd tea.Cmd
-		m.customArea, cmd = m.customArea.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -187,17 +195,77 @@ func (m *statuslineModel) View() string {
 		)
 		return lipgloss.JoinVertical(lipgloss.Left, title, body, warn, hint)
 
-	case stepEditCustom:
-		title := titleStyle.Render("Statusline custom")
-		hint := dimStyle.Render("ctrl+s para guardar · esc para volver")
-		warn := warnStyle.Render(
-			"Se guardará en ~/.claude/statusline.sh y se hará backup de settings.json.",
-		)
-		return lipgloss.JoinVertical(lipgloss.Left, title, m.customArea.View(), warn, hint)
+	case stepBuild:
+		title := titleStyle.Render("Custom — armá tu statusline")
+		body := m.renderSegmentList()
+		activeCount := m.activeCount()
+		var status string
+		if activeCount == 0 {
+			status = warnStyle.Render("Activá al menos un segmento para poder guardar.")
+		} else {
+			status = dimStyle.Render(fmt.Sprintf("%d segmento(s) activo(s)", activeCount))
+		}
+		hint := dimStyle.Render("espacio toggle · ↑↓ moverse · s para guardar · esc para volver")
+		return lipgloss.JoinVertical(lipgloss.Left, title, body, status, hint)
 
 	default:
 		return ""
 	}
+}
+
+// renderSegmentList renderiza la lista de segments con checkboxes y cursor.
+func (m *statuslineModel) renderSegmentList() string {
+	var b strings.Builder
+	b.WriteString("\n")
+	for i, s := range m.segments {
+		check := "[ ]"
+		if s.enabled {
+			check = "[x]"
+		}
+		cursor := "  "
+		line := fmt.Sprintf("%s%s %s — %s", cursor, check, s.seg.Label, s.seg.Description)
+		if i == m.cursor {
+			line = segmentCursorStyle.Render(fmt.Sprintf("> %s %s — %s", check, s.seg.Label, s.seg.Description))
+		} else if s.enabled {
+			line = segmentActiveStyle.Render(line)
+		} else {
+			line = segmentInactiveStyle.Render(line)
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (m *statuslineModel) activeCount() int {
+	n := 0
+	for _, s := range m.segments {
+		if s.enabled {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *statuslineModel) activeIDs() []string {
+	ids := make([]string, 0, len(m.segments))
+	for _, s := range m.segments {
+		if s.enabled {
+			ids = append(ids, s.seg.ID)
+		}
+	}
+	return ids
+}
+
+// newSegmentItems arma la lista inicial: todos los segments DESACTIVADOS,
+// para que el usuario elija explícitamente qué quiere ver.
+func newSegmentItems() []segmentItem {
+	all := presets.AllSegments()
+	out := make([]segmentItem, 0, len(all))
+	for _, s := range all {
+		out = append(out, segmentItem{seg: s, enabled: false})
+	}
+	return out
 }
 
 func (m *statuslineModel) apply() error {
@@ -212,15 +280,17 @@ func (m *statuslineModel) apply() error {
 	return nil
 }
 
-// applyCustom valida el contenido del textarea, lo escribe a
-// ~/.claude/statusline.sh y actualiza settings.json. Retorna el path final.
+// applyCustom genera el script bash a partir de los segments activos,
+// lo escribe a ~/.claude/statusline.sh y actualiza settings.json.
+// Retorna el path final.
 func (m *statuslineModel) applyCustom() (string, error) {
-	body := strings.TrimSpace(m.customArea.Value())
-	if body == "" {
-		return "", fmt.Errorf("el script está vacío")
+	ids := m.activeIDs()
+	if len(ids) == 0 {
+		return "", fmt.Errorf("activá al menos un segmento")
 	}
-	if !strings.HasPrefix(body, "#!") {
-		return "", fmt.Errorf("falta el shebang (la primera línea debe ser tipo #!/usr/bin/env bash)")
+	body, err := presets.BuildCustomScript(ids)
+	if err != nil {
+		return "", fmt.Errorf("generando script: %w", err)
 	}
 
 	home, err := os.UserHomeDir()
@@ -230,10 +300,6 @@ func (m *statuslineModel) applyCustom() (string, error) {
 	path := filepath.Join(home, ".claude", "statusline.sh")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("creando directorio: %w", err)
-	}
-	// Asegurar newline final
-	if !strings.HasSuffix(body, "\n") {
-		body += "\n"
 	}
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		return "", fmt.Errorf("escribiendo %s: %w", path, err)
@@ -245,19 +311,8 @@ func (m *statuslineModel) applyCustom() (string, error) {
 	return path, nil
 }
 
-func newCustomTextarea(w, h int) textarea.Model {
-	ta := textarea.New()
-	ta.Placeholder = customPlaceholder
-	ta.ShowLineNumbers = true
-	ta.CharLimit = 0
-	ta.SetWidth(w - 6)
-	ta.SetHeight(h - 8)
-	ta.Focus()
-	return ta
-}
-
 // presetItem representa un item de la lista de selección. Si isCustom es true,
-// el item dispara el flujo de editor custom y los campos de preset se ignoran.
+// el item dispara el flujo del builder de segments y los campos de preset se ignoran.
 type presetItem struct {
 	preset      presets.Preset
 	isCustom    bool
@@ -291,9 +346,12 @@ func sendBack(msg string) tea.Cmd {
 }
 
 var (
-	backKey  = key.NewBinding(key.WithKeys("esc", "q"))
-	applyKey = key.NewBinding(key.WithKeys("y", "enter"))
-	saveKey  = key.NewBinding(key.WithKeys("ctrl+s"))
+	backKey   = key.NewBinding(key.WithKeys("esc", "q"))
+	applyKey  = key.NewBinding(key.WithKeys("y", "enter"))
+	saveKey   = key.NewBinding(key.WithKeys("s"))
+	toggleKey = key.NewBinding(key.WithKeys(" "))
+	upKey     = key.NewBinding(key.WithKeys("up", "k"))
+	downKey   = key.NewBinding(key.WithKeys("down", "j"))
 
 	titleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#F5B544")).
@@ -318,4 +376,15 @@ var (
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF6B6B")).
 			Padding(2)
+
+	segmentCursorStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#F5B544")).
+				Bold(true).
+				Padding(0, 2)
+	segmentActiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250")).
+				Padding(0, 2)
+	segmentInactiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("240")).
+				Padding(0, 2)
 )
