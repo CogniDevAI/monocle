@@ -9,6 +9,7 @@ func TestAllSegments_HasExpectedIDs(t *testing.T) {
 	got := AllSegments()
 	want := []string{
 		"folder", "branch", "model", "contextBar", "contextPercent",
+		"contextBarRemaining", "contextPercentRemaining",
 		"tokens", "outputStyle", "permissionMode", "time",
 	}
 	if len(got) != len(want) {

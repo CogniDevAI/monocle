@@ -119,6 +119,45 @@ if [ -n "$used_pct" ]; then
 fi`,
 		},
 		{
+			ID:          "contextBarRemaining",
+			Label:       "Barra de contexto disponible",
+			Description: "barra ████░░░░░░ con el % LIBRE (verde alto, rojo bajo)",
+			extracts:    []string{`remaining_pct=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty')`},
+			prep: `seg_contextBarRemaining=""
+if [ -n "$remaining_pct" ]; then
+  rem_int=$(printf '%.0f' "$remaining_pct")
+  filled=$(( rem_int / 10 ))
+  empty=$(( 10 - filled ))
+  bar_fill=$(python3 -c "print('█'*$filled, end='')" 2>/dev/null || echo "")
+  bar_empty=$(python3 -c "print('░'*$empty, end='')" 2>/dev/null || echo "")
+  if [ "$rem_int" -lt 20 ]; then
+    bar_color="$RED"
+  elif [ "$rem_int" -lt 50 ]; then
+    bar_color="$YELLOW"
+  else
+    bar_color="$GREEN"
+  fi
+  seg_contextBarRemaining="${bar_color}${bar_fill}${DIM}${bar_empty}${RESET} ${bar_color}${rem_int}%${RESET} ${DIM}libre${RESET}"
+fi`,
+		},
+		{
+			ID:          "contextPercentRemaining",
+			Label:       "% de contexto disponible",
+			Description: "porcentaje de contexto LIBRE sin barra (verde alto, rojo bajo)",
+			extracts:    []string{`remaining_pct=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty')`},
+			prep: `seg_contextPercentRemaining=""
+if [ -n "$remaining_pct" ]; then
+  rem_int=$(printf '%.0f' "$remaining_pct")
+  if [ "$rem_int" -lt 20 ]; then
+    seg_contextPercentRemaining="${RED}${rem_int}%${RESET} ${DIM}libre${RESET}"
+  elif [ "$rem_int" -lt 50 ]; then
+    seg_contextPercentRemaining="${YELLOW}${rem_int}%${RESET} ${DIM}libre${RESET}"
+  else
+    seg_contextPercentRemaining="${GREEN}${rem_int}%${RESET} ${DIM}libre${RESET}"
+  fi
+fi`,
+		},
+		{
 			ID:          "tokens",
 			Label:       "Tokens entrada/salida",
 			Description: "↑in ↓out con formato Xk cuando aplica",
