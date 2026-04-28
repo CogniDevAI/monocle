@@ -69,6 +69,16 @@ func (s *Settings) Set(key string, value any) {
 	s.data[key] = value
 }
 
+// Delete elimina una clave top-level si existe. No-op si no existe o si la
+// key es vacía. Útil para borrar campos como outputStyle o model en lugar
+// de dejarlos en string vacío "".
+func (s *Settings) Delete(key string) {
+	if key == "" {
+		return
+	}
+	delete(s.data, key)
+}
+
 // Save escribe el JSON con backup. Crea el directorio si hace falta.
 //
 // Orden de operaciones (importa para no dejar archivos huérfanos ni

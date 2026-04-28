@@ -389,6 +389,45 @@ func TestSave_RotatesOldBackups(t *testing.T) {
 	}
 }
 
+func TestDelete(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	writeJSON(t, path, map[string]any{
+		"keep":   "yes",
+		"remove": "this",
+	})
+
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s.Delete("remove")
+	s.Delete("")          // no-op
+	s.Delete("nonexistent") // no-op
+
+	if got := s.Get("remove"); got != nil {
+		t.Errorf("tras Delete, Get(remove) = %v, want nil", got)
+	}
+	if got := s.Get("keep"); got != "yes" {
+		t.Errorf("Delete debe preservar otras keys, keep=%v", got)
+	}
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("re-Load: %v", err)
+	}
+	if got := reloaded.Get("remove"); got != nil {
+		t.Errorf("Delete no se persistió, remove=%v tras reload", got)
+	}
+	if got := reloaded.Get("keep"); got != "yes" {
+		t.Errorf("keep se perdió tras Delete+Save: %v", got)
+	}
+}
+
 func TestDefaultPath_ContainsClaudeSettings(t *testing.T) {
 	p, err := DefaultPath()
 	if err != nil {
