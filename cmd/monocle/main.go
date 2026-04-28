@@ -14,7 +14,9 @@ import (
 	"github.com/CogniDevAI/monocle/internal/ui"
 )
 
-const version = "0.1.0"
+// version se sobreescribe en build vía -ldflags="-X main.version=...".
+// Para que goreleaser pueda inyectarla, debe ser var (no const).
+var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 {
