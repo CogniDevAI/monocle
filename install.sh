@@ -24,20 +24,18 @@ case "$OS" in
   *) echo "sistema operativo no soportado: $OS"; exit 1 ;;
 esac
 
-if [ -z "$VERSION" ]; then
-  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep '"tag_name"' \
-    | head -n1 \
-    | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-fi
-
-if [ -z "$VERSION" ]; then
-  echo "no se pudo determinar la versión más reciente"
-  exit 1
-fi
-
 ASSET="monocle_${OS}_${ARCH}.tar.gz"
-URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
+
+# Si VERSION está seteada, descargamos esa específica.
+# Si no, usamos la URL "latest/download" que redirige al asset de la última
+# release sin tocar la API de GitHub (que tiene rate limit de 60/h por IP).
+if [ -n "$VERSION" ]; then
+  URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
+  VERSION_LABEL="$VERSION"
+else
+  URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+  VERSION_LABEL="latest"
+fi
 
 mkdir -p "$INSTALL_DIR"
 TARGET="$INSTALL_DIR/$BINARY"
@@ -54,7 +52,7 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-echo "▸ descargando $ASSET ($VERSION)..."
+echo "▸ descargando $ASSET ($VERSION_LABEL)..."
 curl -fsSL "$URL" -o "$tmp/$ASSET"
 tar -xzf "$tmp/$ASSET" -C "$tmp"
 
