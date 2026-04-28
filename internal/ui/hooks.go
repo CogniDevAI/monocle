@@ -2,23 +2,26 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/CogniDevAI/monocle/internal/settings"
 )
 
-// hooksModel es el sub-modelo para inspeccionar y eliminar hooks en
-// settings.json. v0.1: solo listar y borrar — no se crean ni editan
-// entradas (eso queda para v0.2).
+// hooksModel es el sub-modelo para inspeccionar, agregar, editar y eliminar
+// hooks en settings.json.
 //
 // Flujo:
 //   stepHookEvents       → lista de eventos (PreToolUse, etc.) con su count
 //   stepHookEntries      → lista de hooks de un evento (matcher + command)
 //   stepHookConfirmDel   → confirm para eliminar un hook → save → flash
+//   stepHookAddEntry     → formulario para agregar matcher + command
+//   stepHookEditEntry    → formulario para editar matcher + command (primer hook interno)
 type hooksModel struct {
 	settings *settings.Settings
 	width    int
@@ -26,13 +29,20 @@ type hooksModel struct {
 
 	step hookStep
 
-	events list.Model // step 1
+	events  list.Model // step 1
 	entries list.Model // step 2
 
 	currentEvent string
-	pendingIdx   int // índice del entry a borrar (en stepHookConfirmDel)
+	pendingIdx   int // índice del entry a borrar/editar
 	flash        string
 	err          error
+
+	// formulario add/edit
+	matcherInput textinput.Model
+	commandInput textinput.Model
+	focusIdx     int // 0 = matcher, 1 = command
+	formErr      string
+	editExtraCmds int // cantidad de comandos extra que se preservarán al editar
 }
 
 type hookStep int
@@ -41,6 +51,8 @@ const (
 	stepHookEvents hookStep = iota
 	stepHookEntries
 	stepHookConfirmDel
+	stepHookAddEntry
+	stepHookEditEntry
 )
 
 // hookEvents son los eventos válidos según la doc de Claude Code.
@@ -195,6 +207,18 @@ func (m *hooksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildEventsList()
 				return m, nil
 			}
+			if key.Matches(v, addKey) {
+				m.openAddForm()
+				return m, textinput.Blink
+			}
+			if key.Matches(v, editKey) {
+				it, ok := m.entries.SelectedItem().(hookEntryItem)
+				if !ok {
+					return m, nil
+				}
+				m.openEditForm(it.idx)
+				return m, textinput.Blink
+			}
 			if key.Matches(v, deleteKey) {
 				it, ok := m.entries.SelectedItem().(hookEntryItem)
 				if !ok {
@@ -220,6 +244,46 @@ func (m *hooksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.step = stepHookEntries
 				return m, nil
 			}
+
+		case stepHookAddEntry, stepHookEditEntry:
+			if key.Matches(v, backKey) {
+				m.closeForm()
+				return m, nil
+			}
+			if key.Matches(v, formSaveKey) {
+				if m.step == stepHookAddEntry {
+					if err := m.saveAdd(); err != nil {
+						m.formErr = err.Error()
+						return m, nil
+					}
+					m.flash = "✓ Hook agregado"
+				} else {
+					if err := m.saveEdit(); err != nil {
+						m.formErr = err.Error()
+						return m, nil
+					}
+					m.flash = "✓ Hook actualizado"
+				}
+				m.closeForm()
+				m.rebuildEntriesList()
+				return m, nil
+			}
+			if key.Matches(v, formNextKey) {
+				m.toggleFormFocus(true)
+				return m, nil
+			}
+			if key.Matches(v, formPrevKey) {
+				m.toggleFormFocus(false)
+				return m, nil
+			}
+			// delegar input al field activo
+			var cmd tea.Cmd
+			if m.focusIdx == 0 {
+				m.matcherInput, cmd = m.matcherInput.Update(msg)
+			} else {
+				m.commandInput, cmd = m.commandInput.Update(msg)
+			}
+			return m, cmd
 		}
 	}
 
@@ -244,8 +308,7 @@ func (m *hooksModel) View() string {
 	switch m.step {
 	case stepHookEvents:
 		hint := dimStyle.Render(
-			"↑↓ moverse · enter elegir evento · esc volver al menú\n" +
-				"agregar/editar próximamente — por ahora solo listar y eliminar",
+			"↑↓ moverse · enter elegir evento · esc volver al menú",
 		)
 		return lipgloss.JoinVertical(lipgloss.Left, m.events.View(), hint)
 
@@ -264,8 +327,7 @@ func (m *hooksModel) View() string {
 				Render(m.flash)
 		}
 		hint := dimStyle.Render(
-			"↑↓ moverse · d eliminar · esc volver\n" +
-				"agregar/editar próximamente",
+			"↑↓ moverse · a agregar · e editar · d eliminar · esc volver",
 		)
 		parts := []string{body}
 		if flash != "" {
@@ -293,9 +355,206 @@ func (m *hooksModel) View() string {
 		)
 		hint := dimStyle.Render("y para confirmar · esc para cancelar")
 		return lipgloss.JoinVertical(lipgloss.Left, title, body, warn, hint)
+
+	case stepHookAddEntry, stepHookEditEntry:
+		return m.renderForm()
 	}
 
 	return ""
+}
+
+// renderForm dibuja el formulario de matcher + command para add/edit.
+func (m *hooksModel) renderForm() string {
+	var titleText string
+	if m.step == stepHookAddEntry {
+		titleText = fmt.Sprintf("Agregar hook a %s", m.currentEvent)
+	} else {
+		titleText = fmt.Sprintf("Editar hook de %s", m.currentEvent)
+	}
+	title := titleStyle.Render(titleText)
+
+	matcherLabel := "Matcher"
+	commandLabel := "Command"
+	if m.focusIdx == 0 {
+		matcherLabel = "▸ " + matcherLabel
+	} else {
+		commandLabel = "▸ " + commandLabel
+	}
+
+	matcherBlock := lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#F5B544")).Bold(true).Padding(0, 2).Render(matcherLabel),
+		lipgloss.NewStyle().Padding(0, 2).Render(m.matcherInput.View()),
+		dimStyle.Render("ej: Bash, Edit, * — vacío matchea todo"),
+	)
+	commandBlock := lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#F5B544")).Bold(true).Padding(0, 2).Render(commandLabel),
+		lipgloss.NewStyle().Padding(0, 2).Render(m.commandInput.View()),
+		dimStyle.Render("comando bash a ejecutar"),
+	)
+
+	parts := []string{title, matcherBlock, commandBlock}
+
+	if m.step == stepHookEditEntry && m.editExtraCmds > 0 {
+		extraHint := dimStyle.Render(fmt.Sprintf(
+			"esta entrada tiene %d comandos; solo se modifica el primero. Los otros se preservan.",
+			m.editExtraCmds+1,
+		))
+		parts = append(parts, extraHint)
+	}
+
+	if m.formErr != "" {
+		parts = append(parts, errorStyle.Render(m.formErr))
+	}
+
+	parts = append(parts, dimStyle.Render("tab cambiar campo · ctrl+s guardar · esc cancelar"))
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// openAddForm prepara los inputs vacíos y entra al formulario de agregar.
+func (m *hooksModel) openAddForm() {
+	m.matcherInput = newFormInput("", "Bash, Edit, * (opcional)")
+	m.commandInput = newFormInput("", "echo 'hola'")
+	m.matcherInput.Focus()
+	m.focusIdx = 0
+	m.formErr = ""
+	m.editExtraCmds = 0
+	m.step = stepHookAddEntry
+}
+
+// openEditForm precarga los inputs con los valores actuales del entry.
+func (m *hooksModel) openEditForm(idx int) {
+	hooks := m.settings.Hooks()
+	entries := hooks[m.currentEvent]
+	if idx < 0 || idx >= len(entries) {
+		return
+	}
+	entry, _ := entries[idx].(map[string]any)
+	matcher, _ := entry["matcher"].(string)
+	command := ""
+	extra := 0
+	if rawHooks, ok := entry["hooks"].([]any); ok && len(rawHooks) > 0 {
+		first, _ := rawHooks[0].(map[string]any)
+		command, _ = first["command"].(string)
+		extra = len(rawHooks) - 1
+	}
+
+	m.matcherInput = newFormInput(matcher, "Bash, Edit, * (opcional)")
+	m.commandInput = newFormInput(command, "echo 'hola'")
+	m.matcherInput.Focus()
+	m.focusIdx = 0
+	m.formErr = ""
+	m.pendingIdx = idx
+	m.editExtraCmds = extra
+	m.step = stepHookEditEntry
+}
+
+func (m *hooksModel) closeForm() {
+	m.matcherInput.Blur()
+	m.commandInput.Blur()
+	m.formErr = ""
+	m.editExtraCmds = 0
+	m.step = stepHookEntries
+}
+
+func (m *hooksModel) toggleFormFocus(forward bool) {
+	_ = forward // ambos sentidos hacen lo mismo: solo hay 2 fields
+	if m.focusIdx == 0 {
+		m.focusIdx = 1
+		m.matcherInput.Blur()
+		m.commandInput.Focus()
+	} else {
+		m.focusIdx = 0
+		m.commandInput.Blur()
+		m.matcherInput.Focus()
+	}
+}
+
+// saveAdd valida los inputs y appendea una nueva entry al evento actual.
+func (m *hooksModel) saveAdd() error {
+	matcher := strings.TrimSpace(m.matcherInput.Value())
+	command := strings.TrimSpace(m.commandInput.Value())
+	if command == "" {
+		return fmt.Errorf("el comando no puede estar vacío")
+	}
+
+	hooks := m.settings.Hooks()
+	entries := hooks[m.currentEvent]
+	newEntry := map[string]any{
+		"matcher": matcher,
+		"hooks": []any{
+			map[string]any{
+				"type":    "command",
+				"command": command,
+			},
+		},
+	}
+	entries = append(entries, newEntry)
+	hooks[m.currentEvent] = entries
+	m.settings.SetHooks(hooks)
+	if err := m.settings.Save(); err != nil {
+		return fmt.Errorf("guardando settings: %w", err)
+	}
+	return nil
+}
+
+// saveEdit valida los inputs y muta el entry pendiente, preservando el resto
+// de los hooks internos si los hubiera.
+func (m *hooksModel) saveEdit() error {
+	matcher := strings.TrimSpace(m.matcherInput.Value())
+	command := strings.TrimSpace(m.commandInput.Value())
+	if command == "" {
+		return fmt.Errorf("el comando no puede estar vacío")
+	}
+
+	hooks := m.settings.Hooks()
+	entries := hooks[m.currentEvent]
+	if m.pendingIdx < 0 || m.pendingIdx >= len(entries) {
+		return fmt.Errorf("índice fuera de rango")
+	}
+
+	entry, _ := entries[m.pendingIdx].(map[string]any)
+	if entry == nil {
+		entry = map[string]any{}
+	}
+	entry["matcher"] = matcher
+
+	rawHooks, _ := entry["hooks"].([]any)
+	if len(rawHooks) == 0 {
+		rawHooks = []any{
+			map[string]any{"type": "command", "command": command},
+		}
+	} else {
+		first, _ := rawHooks[0].(map[string]any)
+		if first == nil {
+			first = map[string]any{"type": "command"}
+		}
+		first["command"] = command
+		if _, ok := first["type"]; !ok {
+			first["type"] = "command"
+		}
+		rawHooks[0] = first
+	}
+	entry["hooks"] = rawHooks
+	entries[m.pendingIdx] = entry
+
+	hooks[m.currentEvent] = entries
+	m.settings.SetHooks(hooks)
+	if err := m.settings.Save(); err != nil {
+		return fmt.Errorf("guardando settings: %w", err)
+	}
+	return nil
+}
+
+// newFormInput arma un textinput.Model con los estilos comunes.
+func newFormInput(value, placeholder string) textinput.Model {
+	ti := textinput.New()
+	ti.Placeholder = placeholder
+	ti.SetValue(value)
+	ti.CharLimit = 512
+	ti.Width = 60
+	return ti
 }
 
 func (m *hooksModel) deleteCurrent() error {
@@ -344,4 +603,11 @@ func (h hookEntryItem) Title() string       { return h.matcher }
 func (h hookEntryItem) Description() string { return h.cmd }
 func (h hookEntryItem) FilterValue() string { return h.matcher }
 
-var deleteKey = key.NewBinding(key.WithKeys("d", "delete", "backspace"))
+var (
+	deleteKey   = key.NewBinding(key.WithKeys("d", "delete", "backspace"))
+	addKey      = key.NewBinding(key.WithKeys("a"))
+	editKey     = key.NewBinding(key.WithKeys("e"))
+	formSaveKey = key.NewBinding(key.WithKeys("ctrl+s"))
+	formNextKey = key.NewBinding(key.WithKeys("tab"))
+	formPrevKey = key.NewBinding(key.WithKeys("shift+tab"))
+)
