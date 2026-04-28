@@ -21,6 +21,7 @@ type appState int
 const (
 	stateMenu appState = iota
 	stateStatusline
+	stateHooks
 )
 
 // App es el modelo raíz que orquesta los sub-modelos.
@@ -47,6 +48,7 @@ func NewApp() (*App, error) {
 
 	items := []list.Item{
 		menuItem{id: "statusline", title: "Statusline", desc: "configurar la barra de estado"},
+		menuItem{id: "hooks", title: "Hooks", desc: "listar y eliminar hooks por evento"},
 		menuItem{id: "exit", title: "Salir", desc: "cerrar Monocle"},
 	}
 	delegate := list.NewDefaultDelegate()
@@ -113,7 +115,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) View() string {
-	if a.state == stateStatusline && a.sub != nil {
+	if (a.state == stateStatusline || a.state == stateHooks) && a.sub != nil {
 		return a.sub.View()
 	}
 
@@ -142,6 +144,11 @@ func (a *App) activateSelection() (tea.Model, tea.Cmd) {
 		a.flash = ""
 		a.state = stateStatusline
 		a.sub = newStatuslineModel(a.settings, a.width, a.height)
+		return a, a.sub.Init()
+	case "hooks":
+		a.flash = ""
+		a.state = stateHooks
+		a.sub = newHooksModel(a.settings, a.width, a.height)
 		return a, a.sub.Init()
 	case "exit":
 		return a, tea.Quit

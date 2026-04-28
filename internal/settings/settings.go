@@ -95,6 +95,48 @@ func (s *Settings) SetStatusLineCommand(scriptPath string) {
 	}
 }
 
+// Hooks devuelve el bloque "hooks" como mapa de evento → lista de entradas.
+// Si el bloque no existe o tiene tipos inesperados, devuelve un mapa vacío.
+// Las entradas internas se devuelven como []any (cada item es típicamente un
+// map[string]any con "matcher" y "hooks"). Mantenemos []any para no romper
+// los tipos arbitrarios que pudieran venir del JSON.
+func (s *Settings) Hooks() map[string][]any {
+	out := map[string][]any{}
+	raw, ok := s.data["hooks"].(map[string]any)
+	if !ok {
+		return out
+	}
+	for event, list := range raw {
+		entries, ok := list.([]any)
+		if !ok {
+			continue
+		}
+		out[event] = entries
+	}
+	return out
+}
+
+// SetHooks reemplaza el bloque "hooks" con el mapa provisto. Si el mapa
+// queda vacío, elimina la clave para no dejar `"hooks": {}` colgado.
+func (s *Settings) SetHooks(hooks map[string][]any) {
+	if len(hooks) == 0 {
+		delete(s.data, "hooks")
+		return
+	}
+	out := map[string]any{}
+	for event, entries := range hooks {
+		if len(entries) == 0 {
+			continue
+		}
+		out[event] = entries
+	}
+	if len(out) == 0 {
+		delete(s.data, "hooks")
+		return
+	}
+	s.data["hooks"] = out
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.ReadFile(src)
 	if err != nil {
