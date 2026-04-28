@@ -1,0 +1,50 @@
+# GoReleaser config — cross-compila Monocle, genera tarballs y los publica
+# en GitHub Releases. Trigger: push de un tag (ej: v0.1.0).
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: monocle
+    main: ./cmd/monocle
+    binary: monocle
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: monocle
+    format: tar.gz
+    name_template: >-
+      monocle_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}amd64
+      {{- else if eq .Arch "arm64" }}arm64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: '{{ incpatch .Version }}-next'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
