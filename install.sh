@@ -40,14 +40,29 @@ ASSET="monocle_${OS}_${ARCH}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 
 mkdir -p "$INSTALL_DIR"
+TARGET="$INSTALL_DIR/$BINARY"
+
+# Si el destino ya es un directorio (por una instalación previa rota),
+# fallar con un mensaje claro en vez de instalar mal en silencio.
+if [ -d "$TARGET" ]; then
+  echo "✗ $TARGET es un directorio — probablemente quedó así por una instalación rota."
+  echo "  Eliminalo con: rm -rf \"$TARGET\""
+  echo "  Luego volvé a correr el install."
+  exit 1
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 echo "▸ descargando $ASSET ($VERSION)..."
 curl -fsSL "$URL" -o "$tmp/$ASSET"
 tar -xzf "$tmp/$ASSET" -C "$tmp"
-mv "$tmp/$BINARY" "$INSTALL_DIR/$BINARY"
-chmod +x "$INSTALL_DIR/$BINARY"
+
+# Removemos el archivo previo si existía para evitar issues de permisos
+# o "Text file busy" si estás reinstalando sobre un binario corriendo.
+rm -f "$TARGET"
+mv "$tmp/$BINARY" "$TARGET"
+chmod +x "$TARGET"
 
 echo "✓ instalado en $INSTALL_DIR/$BINARY"
 
