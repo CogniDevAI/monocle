@@ -2,9 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -14,15 +18,17 @@ import (
 
 // statuslineModel es el sub-modelo para elegir y aplicar un preset
 // de statusline. Flujo: list de presets → preview + confirm → apply.
+// Si el usuario elige "Custom", el flujo pasa por stepEditCustom (textarea).
 type statuslineModel struct {
-	list     list.Model
-	preview  string
-	settings *settings.Settings
-	width    int
-	height   int
-	step     stepState
-	chosen   *presets.Preset
-	err      error
+	list       list.Model
+	preview    string
+	settings   *settings.Settings
+	width      int
+	height     int
+	step       stepState
+	chosen     *presets.Preset
+	customArea textarea.Model
+	err        error
 }
 
 type stepState int
@@ -30,14 +36,28 @@ type stepState int
 const (
 	stepPick stepState = iota
 	stepConfirm
+	stepEditCustom
 	stepDone
 )
 
+const customPlaceholder = `#!/usr/bin/env bash
+# escribí tu statusline acá
+input=$(cat)
+printf "..."
+`
+
 func newStatuslineModel(st *settings.Settings, w, h int) *statuslineModel {
-	items := make([]list.Item, 0, len(presets.All()))
-	for _, p := range presets.All() {
-		items = append(items, presetItem{p})
+	all := presets.All()
+	items := make([]list.Item, 0, len(all)+1)
+	for _, p := range all {
+		items = append(items, presetItem{preset: p})
 	}
+	items = append(items, presetItem{
+		isCustom:    true,
+		customName:  "Custom (escribir el mío)",
+		customDescr: "abrí un editor y pegá/escribí tu propio script bash",
+	})
+
 	delegate := list.NewDefaultDelegate()
 	l := list.New(items, delegate, w-4, h-6)
 	l.Title = "Elegí un preset de statusline"
@@ -64,6 +84,10 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = v.Width, v.Height
 		m.list.SetSize(v.Width-4, v.Height-6)
+		if m.step == stepEditCustom {
+			m.customArea.SetWidth(v.Width - 6)
+			m.customArea.SetHeight(v.Height - 8)
+		}
 
 	case tea.KeyMsg:
 		switch m.step {
@@ -75,6 +99,11 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				it, ok := m.list.SelectedItem().(presetItem)
 				if !ok {
 					return m, nil
+				}
+				if it.isCustom {
+					m.customArea = newCustomTextarea(m.width, m.height)
+					m.step = stepEditCustom
+					return m, textarea.Blink
 				}
 				body, err := it.preset.Content()
 				if err != nil {
@@ -101,14 +130,39 @@ func (m *statuslineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				name := m.chosen.Name
 				return m, sendBack(fmt.Sprintf("✓ Statusline aplicado: %s", name))
 			}
+		case stepEditCustom:
+			// En el editor solo `esc` cancela — `q` debe poder escribirse
+			// como parte del script bash sin abortar la edición.
+			if v.String() == "esc" {
+				m.step = stepPick
+				m.customArea.Reset()
+				m.err = nil
+				return m, nil
+			}
+			if key.Matches(v, saveKey) {
+				path, err := m.applyCustom()
+				if err != nil {
+					m.err = err
+					return m, nil
+				}
+				return m, sendBack(fmt.Sprintf("✓ Statusline custom aplicado en %s", path))
+			}
+			var cmd tea.Cmd
+			m.customArea, cmd = m.customArea.Update(msg)
+			return m, cmd
 		case stepDone:
 			return m, sendBack("")
 		}
 	}
 
-	if m.step == stepPick {
+	switch m.step {
+	case stepPick:
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+	case stepEditCustom:
+		var cmd tea.Cmd
+		m.customArea, cmd = m.customArea.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -133,6 +187,14 @@ func (m *statuslineModel) View() string {
 		)
 		return lipgloss.JoinVertical(lipgloss.Left, title, body, warn, hint)
 
+	case stepEditCustom:
+		title := titleStyle.Render("Statusline custom")
+		hint := dimStyle.Render("ctrl+s para guardar · esc para volver")
+		warn := warnStyle.Render(
+			"Se guardará en ~/.claude/statusline.sh y se hará backup de settings.json.",
+		)
+		return lipgloss.JoinVertical(lipgloss.Left, title, m.customArea.View(), warn, hint)
+
 	default:
 		return ""
 	}
@@ -150,11 +212,79 @@ func (m *statuslineModel) apply() error {
 	return nil
 }
 
-type presetItem struct{ preset presets.Preset }
+// applyCustom valida el contenido del textarea, lo escribe a
+// ~/.claude/statusline.sh y actualiza settings.json. Retorna el path final.
+func (m *statuslineModel) applyCustom() (string, error) {
+	body := strings.TrimSpace(m.customArea.Value())
+	if body == "" {
+		return "", fmt.Errorf("el script está vacío")
+	}
+	if !strings.HasPrefix(body, "#!") {
+		return "", fmt.Errorf("falta el shebang (la primera línea debe ser tipo #!/usr/bin/env bash)")
+	}
 
-func (p presetItem) Title() string       { return p.preset.Name }
-func (p presetItem) Description() string { return p.preset.Description }
-func (p presetItem) FilterValue() string { return p.preset.Name }
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	path := filepath.Join(home, ".claude", "statusline.sh")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", fmt.Errorf("creando directorio: %w", err)
+	}
+	// Asegurar newline final
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		return "", fmt.Errorf("escribiendo %s: %w", path, err)
+	}
+	m.settings.SetStatusLineCommand(path)
+	if err := m.settings.Save(); err != nil {
+		return "", fmt.Errorf("guardando settings: %w", err)
+	}
+	return path, nil
+}
+
+func newCustomTextarea(w, h int) textarea.Model {
+	ta := textarea.New()
+	ta.Placeholder = customPlaceholder
+	ta.ShowLineNumbers = true
+	ta.CharLimit = 0
+	ta.SetWidth(w - 6)
+	ta.SetHeight(h - 8)
+	ta.Focus()
+	return ta
+}
+
+// presetItem representa un item de la lista de selección. Si isCustom es true,
+// el item dispara el flujo de editor custom y los campos de preset se ignoran.
+type presetItem struct {
+	preset      presets.Preset
+	isCustom    bool
+	customName  string
+	customDescr string
+}
+
+func (p presetItem) Title() string {
+	if p.isCustom {
+		return p.customName
+	}
+	return p.preset.Name
+}
+
+func (p presetItem) Description() string {
+	if p.isCustom {
+		return p.customDescr
+	}
+	return p.preset.Description
+}
+
+func (p presetItem) FilterValue() string {
+	if p.isCustom {
+		return p.customName
+	}
+	return p.preset.Name
+}
 
 func sendBack(msg string) tea.Cmd {
 	return func() tea.Msg { return backToMenuMsg(msg) }
@@ -163,6 +293,7 @@ func sendBack(msg string) tea.Cmd {
 var (
 	backKey  = key.NewBinding(key.WithKeys("esc", "q"))
 	applyKey = key.NewBinding(key.WithKeys("y", "enter"))
+	saveKey  = key.NewBinding(key.WithKeys("ctrl+s"))
 
 	titleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#F5B544")).
