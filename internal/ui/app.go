@@ -6,7 +6,9 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -14,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/CogniDevAI/monocle/internal/settings"
+	"github.com/CogniDevAI/monocle/internal/updater"
 )
 
 type appState int
@@ -26,17 +29,22 @@ const (
 
 // App es el modelo raíz que orquesta los sub-modelos.
 type App struct {
-	state    appState
-	menu     list.Model
-	sub      tea.Model
-	settings *settings.Settings
-	width    int
-	height   int
-	flash    string // mensaje efímero (post-acción)
+	state          appState
+	menu           list.Model
+	sub            tea.Model
+	settings       *settings.Settings
+	width          int
+	height         int
+	flash          string // mensaje efímero (post-acción)
+	currentVersion string // versión inyectada al build (o "dev")
+	updateAvail    string // versión nueva detectada en GitHub, "" si no hay
 }
 
 // NewApp construye el modelo inicial cargando settings.json.
-func NewApp() (*App, error) {
+//
+// currentVersion es la versión inyectada por -ldflags al build. Si vale
+// "dev" el chequeo de actualizaciones se omite (build de desarrollo).
+func NewApp(currentVersion string) (*App, error) {
 	path, err := settings.DefaultPath()
 	if err != nil {
 		return nil, err
@@ -63,13 +71,22 @@ func NewApp() (*App, error) {
 		Bold(true)
 
 	return &App{
-		state:    stateMenu,
-		menu:     l,
-		settings: st,
+		state:          stateMenu,
+		menu:           l,
+		settings:       st,
+		currentVersion: currentVersion,
 	}, nil
 }
 
-func (a *App) Init() tea.Cmd { return nil }
+// Init dispara el chequeo de actualizaciones en background. Si la versión
+// es "dev" no se chequea (build local). Cualquier error de red se traga
+// silenciosamente — la falta de banner es la respuesta correcta.
+func (a *App) Init() tea.Cmd {
+	if a.currentVersion == "" || a.currentVersion == "dev" {
+		return nil
+	}
+	return checkForUpdate(a.currentVersion)
+}
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m := msg.(type) {
@@ -98,6 +115,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sub = nil
 		a.flash = string(m)
 		return a, nil
+
+	case updateAvailableMsg:
+		a.updateAvail = string(m)
+		return a, nil
 	}
 
 	if a.state == stateMenu {
@@ -120,6 +141,14 @@ func (a *App) View() string {
 	}
 
 	body := a.menu.View()
+	if a.updateAvail != "" {
+		banner := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F5B544")).
+			Bold(true).
+			Padding(0, 2).
+			Render(fmt.Sprintf("⚡ Hay v%s disponible — corré 'monocle update'", a.updateAvail))
+		body = lipgloss.JoinVertical(lipgloss.Left, banner, body)
+	}
 	if a.flash != "" {
 		body = lipgloss.JoinVertical(lipgloss.Left,
 			body,
@@ -159,6 +188,27 @@ func (a *App) activateSelection() (tea.Model, tea.Cmd) {
 // backToMenuMsg lo emite un sub-modelo para volver al menú principal.
 // Su contenido es el mensaje de flash que se muestra al usuario.
 type backToMenuMsg string
+
+// updateAvailableMsg lo emite el chequeo de actualizaciones cuando detecta
+// una versión nueva en GitHub. Su contenido es la versión latest normalizada.
+type updateAvailableMsg string
+
+// checkForUpdate consulta GitHub Releases y, si hay una versión nueva,
+// emite updateAvailableMsg. Cualquier error se ignora — no hay UI para errores.
+func checkForUpdate(current string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		latest, err := updater.LatestVersion(ctx)
+		if err != nil {
+			return nil
+		}
+		if !updater.IsNewer(current, latest) {
+			return nil
+		}
+		return updateAvailableMsg(latest)
+	}
+}
 
 var (
 	quitKey  = key.NewBinding(key.WithKeys("q", "esc", "ctrl+c"))
