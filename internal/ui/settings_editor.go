@@ -54,6 +54,8 @@ const (
 	sectionOutputStyle settingsSection = "outputStyle"
 	sectionModel       settingsSection = "model"
 	sectionMisc        settingsSection = "misc"
+	sectionEnv         settingsSection = "env"
+	sectionMCPServers  settingsSection = "mcpServers"
 )
 
 func newSettingsModel(st *settings.Settings, w, h int) *settingsModel {
@@ -88,6 +90,16 @@ func (m *settingsModel) rebuildRoot() {
 			id:    sectionMisc,
 			title: "Misc toggles",
 			desc:  "co-author, cleanup days, effort level",
+		},
+		settingsRootItem{
+			id:    sectionEnv,
+			title: "Variables de entorno",
+			desc:  "bloque env: pares KEY=VALUE",
+		},
+		settingsRootItem{
+			id:    sectionMCPServers,
+			title: "MCP Servers",
+			desc:  "servidores MCP configurados (command, args, env)",
 		},
 	}
 	w, h := m.listSize()
@@ -227,6 +239,10 @@ func newSubEditor(section settingsSection, st *settings.Settings, w, h int) tea.
 		return newModelEditor(st, w, h)
 	case sectionMisc:
 		return newMiscEditor(st, w, h)
+	case sectionEnv:
+		return newEnvEditor(st, w, h)
+	case sectionMCPServers:
+		return newMCPServersEditor(st, w, h)
 	}
 	return nil
 }
@@ -304,10 +320,11 @@ func setStringList(perms map[string]any, key string, vals []string) {
 	perms[key] = out
 }
 
-// savePermissions reescribe el bloque permissions y persiste.
+// savePermissions reescribe el bloque permissions y persiste. Si el bloque
+// queda vacío, borra la clave para no dejar `"permissions": {}` colgado.
 func savePermissions(st *settings.Settings, perms map[string]any) error {
 	if len(perms) == 0 {
-		st.Set("permissions", map[string]any{})
+		st.Delete("permissions")
 	} else {
 		st.Set("permissions", perms)
 	}
@@ -338,6 +355,10 @@ type permissionsEditor struct {
 	// stepPermConfirmDel
 	pendingRule string
 
+	// stepPermAddRule
+	addInput textinput.Model
+	addErr   string
+
 	flash string
 	err   error
 }
@@ -350,6 +371,7 @@ const (
 	stepPermAllowList
 	stepPermDenyList
 	stepPermConfirmDel
+	stepPermAddRule
 )
 
 var validDefaultModes = []string{"default", "acceptEdits", "bypassPermissions", "plan"}
@@ -541,6 +563,10 @@ func (m *permissionsEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildRoot()
 				return m, nil
 			}
+			if key.Matches(v, addKey) {
+				m.openAddRule()
+				return m, textinput.Blink
+			}
 			if key.Matches(v, deleteKey) {
 				it, ok := m.rulesUI.SelectedItem().(simpleItem)
 				if !ok {
@@ -548,6 +574,34 @@ func (m *permissionsEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.pendingRule = it.id
 				m.step = stepPermConfirmDel
+				return m, nil
+			}
+
+		case stepPermAddRule:
+			if key.Matches(v, backKey) {
+				m.addInput.Blur()
+				m.addErr = ""
+				if m.listKey == "allow" {
+					m.step = stepPermAllowList
+				} else {
+					m.step = stepPermDenyList
+				}
+				return m, nil
+			}
+			if key.Matches(v, formSaveKey) || v.Type == tea.KeyEnter {
+				if err := m.saveAddRule(); err != nil {
+					m.addErr = err.Error()
+					return m, nil
+				}
+				m.flash = fmt.Sprintf("✓ regla %s agregada", m.listKey)
+				m.addInput.Blur()
+				m.addErr = ""
+				m.rebuildRulesList()
+				if m.listKey == "allow" {
+					m.step = stepPermAllowList
+				} else {
+					m.step = stepPermDenyList
+				}
 				return m, nil
 			}
 
@@ -590,6 +644,10 @@ func (m *permissionsEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.rulesUI, cmd = m.rulesUI.Update(msg)
 		return m, cmd
+	case stepPermAddRule:
+		var cmd tea.Cmd
+		m.addInput, cmd = m.addInput.Update(msg)
+		return m, cmd
 	}
 	return m, nil
 }
@@ -622,8 +680,7 @@ func (m *permissionsEditor) View() string {
 			body = dimStyle.Render(fmt.Sprintf("No hay reglas de %s configuradas.", m.listKey))
 		}
 		hint := dimStyle.Render(
-			"↑↓ moverse · d eliminar · esc volver\n" +
-				"agregar reglas próximamente (v0.5)",
+			"↑↓ moverse · a agregar · d eliminar · esc volver",
 		)
 		parts := []string{body}
 		if m.flash != "" {
@@ -633,6 +690,19 @@ func (m *permissionsEditor) View() string {
 				Render(m.flash))
 		}
 		parts = append(parts, hint)
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	case stepPermAddRule:
+		title := titleStyle.Render(fmt.Sprintf("Agregar regla a %s", m.listKey))
+		input := previewStyle.Render(m.addInput.View())
+		examples := dimStyle.Render(
+			"Ejemplos: Bash(npm install) · Read(*.env) · Edit(src/**) · WebFetch(*)",
+		)
+		parts := []string{title, input, examples}
+		if m.addErr != "" {
+			parts = append(parts, errorStyle.Render(m.addErr))
+		}
+		parts = append(parts, dimStyle.Render("enter o ctrl+s guardar · esc cancelar"))
 		return lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	case stepPermConfirmDel:
@@ -659,6 +729,32 @@ func (m *permissionsEditor) applyDefaultMode(modeID string) error {
 	} else {
 		perms["defaultMode"] = modeID
 	}
+	return savePermissions(m.settings, perms)
+}
+
+// openAddRule prepara el textinput para tipear una regla nueva.
+func (m *permissionsEditor) openAddRule() {
+	m.addInput = newFormInput("", "Bash(npm install)")
+	m.addInput.Focus()
+	m.addErr = ""
+	m.step = stepPermAddRule
+}
+
+// saveAddRule valida y persiste la regla nueva. No vacío y sin duplicados.
+func (m *permissionsEditor) saveAddRule() error {
+	rule := strings.TrimSpace(m.addInput.Value())
+	if rule == "" {
+		return fmt.Errorf("la regla no puede estar vacía")
+	}
+	perms := getPermissions(m.settings)
+	rules := getStringList(perms, m.listKey)
+	for _, r := range rules {
+		if r == rule {
+			return fmt.Errorf("la regla ya existe en %s", m.listKey)
+		}
+	}
+	rules = append(rules, rule)
+	setStringList(perms, m.listKey, rules)
 	return savePermissions(m.settings, perms)
 }
 
@@ -874,11 +970,7 @@ func (m *outputStyleEditor) View() string {
 // applyValue persiste outputStyle. Si val es "", elimina la key.
 func (m *outputStyleEditor) applyValue(val string) error {
 	if val == "" {
-		// Set("", ...) es no-op. Para borrar necesitamos un truco:
-		// ponemos "" igual sería un valor distinto a unset. La API
-		// pública sólo expone Set/Save, así que setear "" es lo
-		// más cercano sin tocar settings.go. Aceptable por ahora.
-		m.settings.Set("outputStyle", "")
+		m.settings.Delete("outputStyle")
 	} else {
 		m.settings.Set("outputStyle", val)
 	}
@@ -978,7 +1070,7 @@ func (m *modelEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if it.id == "__unset__" {
-				m.settings.Set("model", "")
+				m.settings.Delete("model")
 				if err := m.settings.Save(); err != nil {
 					m.err = err
 					return m, nil
@@ -1214,7 +1306,7 @@ func (m *miscEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if it.id == "__unset__" {
-					m.settings.Set("effortLevel", "")
+					m.settings.Delete("effortLevel")
 				} else {
 					m.settings.Set("effortLevel", it.id)
 				}
@@ -1359,4 +1451,838 @@ func titleListStyle() lipgloss.Style {
 		Foreground(lipgloss.Color("#1A1308")).
 		Padding(0, 1).
 		Bold(true)
+}
+
+// truncate corta un string a max chars y agrega "…" si fue cortado.
+func truncate(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	if max <= 1 {
+		return "…"
+	}
+	return s[:max-1] + "…"
+}
+
+// =====================================================================
+// Env editor — bloque "env" como pares KEY=VALUE
+// =====================================================================
+
+type envEditor struct {
+	settings *settings.Settings
+	width    int
+	height   int
+
+	step envStep
+
+	list list.Model
+
+	// stepEnvForm: dos textinputs (KEY, VALUE)
+	keyInput   textinput.Model
+	valueInput textinput.Model
+	focusIdx   int // 0 = KEY, 1 = VALUE
+	formErr    string
+	editingKey string // si != "" estamos editando esa key. Vacío → add.
+	originalKey string // key original cuando se editó (para detectar rename)
+
+	// stepEnvConfirmDel
+	pendingKey string
+
+	flash string
+	err   error
+}
+
+type envStep int
+
+const (
+	stepEnvList envStep = iota
+	stepEnvForm
+	stepEnvConfirmDel
+)
+
+func newEnvEditor(st *settings.Settings, w, h int) *envEditor {
+	m := &envEditor{
+		settings: st,
+		width:    w,
+		height:   h,
+		step:     stepEnvList,
+	}
+	m.rebuildList()
+	return m
+}
+
+// getEnv devuelve el bloque env como map de string→string. Tolera valores
+// no-string (los descarta) — Claude Code documenta env como string→string.
+func getEnv(st *settings.Settings) map[string]string {
+	out := map[string]string{}
+	raw, ok := st.Get("env").(map[string]any)
+	if !ok {
+		return out
+	}
+	for k, v := range raw {
+		if s, ok := v.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
+}
+
+// saveEnv persiste el bloque env. Si queda vacío, lo borra.
+func saveEnv(st *settings.Settings, env map[string]string) error {
+	if len(env) == 0 {
+		st.Delete("env")
+		return st.Save()
+	}
+	out := make(map[string]any, len(env))
+	for k, v := range env {
+		out[k] = v
+	}
+	st.Set("env", out)
+	return st.Save()
+}
+
+// sortedKeys devuelve las keys ordenadas alfabéticamente para listas estables.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	return keys
+}
+
+func (m *envEditor) rebuildList() {
+	env := getEnv(m.settings)
+	keys := sortedKeys(env)
+	items := make([]list.Item, 0, len(keys))
+	for _, k := range keys {
+		items = append(items, simpleItem{
+			titleText: k,
+			descText:  truncate(env[k], 60),
+			id:        k,
+		})
+	}
+	w, h := m.listSize()
+	l := list.New(items, list.NewDefaultDelegate(), w, h)
+	l.Title = fmt.Sprintf("Variables de entorno (%d)", len(keys))
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+	l.Styles.Title = titleListStyle()
+	m.list = l
+}
+
+func (m *envEditor) listSize() (int, int) {
+	w := m.width - 4
+	h := m.height - 6
+	if w < 20 {
+		w = 20
+	}
+	if h < 5 {
+		h = 5
+	}
+	return w, h
+}
+
+func (m *envEditor) Init() tea.Cmd { return nil }
+
+func (m *envEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch v := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = v.Width, v.Height
+		w, h := m.listSize()
+		m.list.SetSize(w, h)
+
+	case tea.KeyMsg:
+		switch m.step {
+		case stepEnvList:
+			if key.Matches(v, backKey) {
+				return m, sendBackToSettings("")
+			}
+			if key.Matches(v, addKey) {
+				m.openForm("", "")
+				return m, textinput.Blink
+			}
+			if key.Matches(v, editKey) {
+				it, ok := m.list.SelectedItem().(simpleItem)
+				if !ok {
+					return m, nil
+				}
+				env := getEnv(m.settings)
+				m.openForm(it.id, env[it.id])
+				return m, textinput.Blink
+			}
+			if key.Matches(v, deleteKey) {
+				it, ok := m.list.SelectedItem().(simpleItem)
+				if !ok {
+					return m, nil
+				}
+				m.pendingKey = it.id
+				m.step = stepEnvConfirmDel
+				return m, nil
+			}
+
+		case stepEnvForm:
+			if key.Matches(v, backKey) {
+				m.closeForm()
+				return m, nil
+			}
+			if key.Matches(v, formSaveKey) {
+				if err := m.saveForm(); err != nil {
+					m.formErr = err.Error()
+					return m, nil
+				}
+				if m.editingKey != "" {
+					m.flash = fmt.Sprintf("✓ env %s actualizada", m.keyInput.Value())
+				} else {
+					m.flash = fmt.Sprintf("✓ env %s agregada", m.keyInput.Value())
+				}
+				m.closeForm()
+				m.rebuildList()
+				return m, nil
+			}
+			if key.Matches(v, formNextKey) {
+				m.toggleFocus(true)
+				return m, nil
+			}
+			if key.Matches(v, formPrevKey) {
+				m.toggleFocus(false)
+				return m, nil
+			}
+			var cmd tea.Cmd
+			if m.focusIdx == 0 {
+				m.keyInput, cmd = m.keyInput.Update(msg)
+			} else {
+				m.valueInput, cmd = m.valueInput.Update(msg)
+			}
+			return m, cmd
+
+		case stepEnvConfirmDel:
+			if key.Matches(v, backKey) {
+				m.step = stepEnvList
+				return m, nil
+			}
+			if key.Matches(v, applyKey) {
+				if err := m.deleteCurrent(); err != nil {
+					m.err = err
+					return m, nil
+				}
+				m.flash = fmt.Sprintf("✓ env %s eliminada", m.pendingKey)
+				m.rebuildList()
+				m.step = stepEnvList
+				return m, nil
+			}
+		}
+	}
+
+	if m.step == stepEnvList {
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m *envEditor) View() string {
+	if m.err != nil {
+		return errorStyle.Render(fmt.Sprintf("Error: %v\n\nesc para volver", m.err))
+	}
+
+	switch m.step {
+	case stepEnvList:
+		body := m.list.View()
+		if len(m.list.Items()) == 0 {
+			body = dimStyle.Render("No hay variables de entorno configuradas.")
+		}
+		hint := dimStyle.Render(
+			"↑↓ moverse · a agregar · e editar · d eliminar · esc volver",
+		)
+		parts := []string{body}
+		if m.flash != "" {
+			parts = append(parts, lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#5FD6C4")).
+				Padding(0, 2).
+				Render(m.flash))
+		}
+		parts = append(parts, hint)
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	case stepEnvForm:
+		titleText := "Agregar variable de entorno"
+		if m.editingKey != "" {
+			titleText = fmt.Sprintf("Editar variable de entorno (%s)", m.editingKey)
+		}
+		title := titleStyle.Render(titleText)
+		keyLabel := "KEY"
+		valLabel := "VALUE"
+		if m.focusIdx == 0 {
+			keyLabel = "▸ " + keyLabel
+		} else {
+			valLabel = "▸ " + valLabel
+		}
+		keyBlock := lipgloss.JoinVertical(
+			lipgloss.Left,
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5B544")).Bold(true).Padding(0, 2).Render(keyLabel),
+			lipgloss.NewStyle().Padding(0, 2).Render(m.keyInput.View()),
+			dimStyle.Render("sin espacios ni '='. Ej: ANTHROPIC_API_KEY"),
+		)
+		valBlock := lipgloss.JoinVertical(
+			lipgloss.Left,
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5B544")).Bold(true).Padding(0, 2).Render(valLabel),
+			lipgloss.NewStyle().Padding(0, 2).Render(m.valueInput.View()),
+			dimStyle.Render("cualquier string"),
+		)
+		parts := []string{title, keyBlock, valBlock}
+		if m.formErr != "" {
+			parts = append(parts, errorStyle.Render(m.formErr))
+		}
+		parts = append(parts, dimStyle.Render("tab cambiar campo · ctrl+s guardar · esc cancelar"))
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	case stepEnvConfirmDel:
+		title := titleStyle.Render(fmt.Sprintf("Eliminar variable %s", m.pendingKey))
+		warn := warnStyle.Render("Se hará backup de ~/.claude/settings.json antes de modificarlo.")
+		hint := dimStyle.Render("y para confirmar · esc para cancelar")
+		return lipgloss.JoinVertical(lipgloss.Left, title, warn, hint)
+	}
+	return ""
+}
+
+func (m *envEditor) openForm(k, v string) {
+	m.keyInput = newFormInput(k, "ANTHROPIC_API_KEY")
+	m.valueInput = newFormInput(v, "valor")
+	m.keyInput.Focus()
+	m.focusIdx = 0
+	m.formErr = ""
+	m.editingKey = k
+	m.originalKey = k
+	m.step = stepEnvForm
+}
+
+func (m *envEditor) closeForm() {
+	m.keyInput.Blur()
+	m.valueInput.Blur()
+	m.formErr = ""
+	m.editingKey = ""
+	m.originalKey = ""
+	m.step = stepEnvList
+}
+
+func (m *envEditor) toggleFocus(forward bool) {
+	_ = forward
+	if m.focusIdx == 0 {
+		m.focusIdx = 1
+		m.keyInput.Blur()
+		m.valueInput.Focus()
+	} else {
+		m.focusIdx = 0
+		m.valueInput.Blur()
+		m.keyInput.Focus()
+	}
+}
+
+// validateEnvKey rechaza vacío, espacios, '=' o tabs.
+func validateEnvKey(k string) error {
+	if k == "" {
+		return fmt.Errorf("la key no puede estar vacía")
+	}
+	if strings.ContainsAny(k, "= \t\n\r") {
+		return fmt.Errorf("la key no puede contener '=' ni espacios")
+	}
+	return nil
+}
+
+func (m *envEditor) saveForm() error {
+	k := strings.TrimSpace(m.keyInput.Value())
+	v := m.valueInput.Value()
+	if err := validateEnvKey(k); err != nil {
+		return err
+	}
+	env := getEnv(m.settings)
+
+	// Detectar duplicado: si la key elegida existe pero NO es la que estamos
+	// editando (es decir, rename hacia una key existente), abortar.
+	if _, exists := env[k]; exists && k != m.originalKey {
+		return fmt.Errorf("la key %s ya existe", k)
+	}
+
+	// Si estábamos editando y se renombró la key, borrar la vieja.
+	if m.originalKey != "" && m.originalKey != k {
+		delete(env, m.originalKey)
+	}
+	env[k] = v
+	return saveEnv(m.settings, env)
+}
+
+func (m *envEditor) deleteCurrent() error {
+	env := getEnv(m.settings)
+	delete(env, m.pendingKey)
+	return saveEnv(m.settings, env)
+}
+
+// =====================================================================
+// MCP Servers editor — bloque "mcpServers"
+// =====================================================================
+
+type mcpServersEditor struct {
+	settings *settings.Settings
+	width    int
+	height   int
+
+	step mcpStep
+
+	list list.Model
+
+	// formulario
+	nameInput    textinput.Model
+	commandInput textinput.Model
+	argsInput    textinput.Model
+	envInput     textinput.Model
+	focusIdx     int // 0..3
+	formErr      string
+	editingName  string // != "" si editando
+	originalName string
+
+	// confirm del
+	pendingName string
+
+	flash string
+	err   error
+}
+
+type mcpStep int
+
+const (
+	stepMCPList mcpStep = iota
+	stepMCPForm
+	stepMCPConfirmDel
+)
+
+func newMCPServersEditor(st *settings.Settings, w, h int) *mcpServersEditor {
+	m := &mcpServersEditor{
+		settings: st,
+		width:    w,
+		height:   h,
+		step:     stepMCPList,
+	}
+	m.rebuildList()
+	return m
+}
+
+// mcpServer es la representación interna de un server. Mantenemos los
+// tipos del JSON original (env como map[string]any → string→string filtrado).
+type mcpServer struct {
+	Command string
+	Args    []string
+	Env     map[string]string
+}
+
+func getMCPServers(st *settings.Settings) map[string]mcpServer {
+	out := map[string]mcpServer{}
+	raw, ok := st.Get("mcpServers").(map[string]any)
+	if !ok {
+		return out
+	}
+	for name, val := range raw {
+		obj, ok := val.(map[string]any)
+		if !ok {
+			continue
+		}
+		cmd, _ := obj["command"].(string)
+		args := []string{}
+		if rawArgs, ok := obj["args"].([]any); ok {
+			for _, a := range rawArgs {
+				if s, ok := a.(string); ok {
+					args = append(args, s)
+				}
+			}
+		}
+		env := map[string]string{}
+		if rawEnv, ok := obj["env"].(map[string]any); ok {
+			for k, v := range rawEnv {
+				if s, ok := v.(string); ok {
+					env[k] = s
+				}
+			}
+		}
+		out[name] = mcpServer{Command: cmd, Args: args, Env: env}
+	}
+	return out
+}
+
+// saveMCPServers reescribe el bloque mcpServers. Si queda vacío, lo borra.
+// Para cada server omite "args" o "env" si están vacíos para no inflar el JSON.
+func saveMCPServers(st *settings.Settings, servers map[string]mcpServer) error {
+	if len(servers) == 0 {
+		st.Delete("mcpServers")
+		return st.Save()
+	}
+	out := map[string]any{}
+	for name, s := range servers {
+		entry := map[string]any{
+			"command": s.Command,
+		}
+		if len(s.Args) > 0 {
+			args := make([]any, len(s.Args))
+			for i, a := range s.Args {
+				args[i] = a
+			}
+			entry["args"] = args
+		}
+		if len(s.Env) > 0 {
+			env := map[string]any{}
+			for k, v := range s.Env {
+				env[k] = v
+			}
+			entry["env"] = env
+		}
+		out[name] = entry
+	}
+	st.Set("mcpServers", out)
+	return st.Save()
+}
+
+func (m *mcpServersEditor) rebuildList() {
+	servers := getMCPServers(m.settings)
+	names := make([]string, 0, len(servers))
+	for n := range servers {
+		names = append(names, n)
+	}
+	sortStrings(names)
+	items := make([]list.Item, 0, len(names))
+	for _, n := range names {
+		s := servers[n]
+		desc := truncate(s.Command, 50)
+		if len(s.Args) > 0 {
+			desc = truncate(s.Command+" "+strings.Join(s.Args, " "), 60)
+		}
+		items = append(items, simpleItem{
+			titleText: n,
+			descText:  desc,
+			id:        n,
+		})
+	}
+	w, h := m.listSize()
+	l := list.New(items, list.NewDefaultDelegate(), w, h)
+	l.Title = fmt.Sprintf("MCP Servers (%d)", len(names))
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+	l.Styles.Title = titleListStyle()
+	m.list = l
+}
+
+func (m *mcpServersEditor) listSize() (int, int) {
+	w := m.width - 4
+	h := m.height - 6
+	if w < 20 {
+		w = 20
+	}
+	if h < 5 {
+		h = 5
+	}
+	return w, h
+}
+
+func (m *mcpServersEditor) Init() tea.Cmd { return nil }
+
+func (m *mcpServersEditor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch v := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = v.Width, v.Height
+		w, h := m.listSize()
+		m.list.SetSize(w, h)
+
+	case tea.KeyMsg:
+		switch m.step {
+		case stepMCPList:
+			if key.Matches(v, backKey) {
+				return m, sendBackToSettings("")
+			}
+			if key.Matches(v, addKey) {
+				m.openForm("", mcpServer{})
+				return m, textinput.Blink
+			}
+			if key.Matches(v, editKey) {
+				it, ok := m.list.SelectedItem().(simpleItem)
+				if !ok {
+					return m, nil
+				}
+				servers := getMCPServers(m.settings)
+				m.openForm(it.id, servers[it.id])
+				return m, textinput.Blink
+			}
+			if key.Matches(v, deleteKey) {
+				it, ok := m.list.SelectedItem().(simpleItem)
+				if !ok {
+					return m, nil
+				}
+				m.pendingName = it.id
+				m.step = stepMCPConfirmDel
+				return m, nil
+			}
+
+		case stepMCPForm:
+			if key.Matches(v, backKey) {
+				m.closeForm()
+				return m, nil
+			}
+			if key.Matches(v, formSaveKey) {
+				if err := m.saveForm(); err != nil {
+					m.formErr = err.Error()
+					return m, nil
+				}
+				if m.editingName != "" {
+					m.flash = fmt.Sprintf("✓ MCP server %s actualizado", m.nameInput.Value())
+				} else {
+					m.flash = fmt.Sprintf("✓ MCP server %s agregado", m.nameInput.Value())
+				}
+				m.closeForm()
+				m.rebuildList()
+				return m, nil
+			}
+			if key.Matches(v, formNextKey) {
+				m.cycleFocus(1)
+				return m, nil
+			}
+			if key.Matches(v, formPrevKey) {
+				m.cycleFocus(-1)
+				return m, nil
+			}
+			var cmd tea.Cmd
+			switch m.focusIdx {
+			case 0:
+				m.nameInput, cmd = m.nameInput.Update(msg)
+			case 1:
+				m.commandInput, cmd = m.commandInput.Update(msg)
+			case 2:
+				m.argsInput, cmd = m.argsInput.Update(msg)
+			case 3:
+				m.envInput, cmd = m.envInput.Update(msg)
+			}
+			return m, cmd
+
+		case stepMCPConfirmDel:
+			if key.Matches(v, backKey) {
+				m.step = stepMCPList
+				return m, nil
+			}
+			if key.Matches(v, applyKey) {
+				if err := m.deleteCurrent(); err != nil {
+					m.err = err
+					return m, nil
+				}
+				m.flash = fmt.Sprintf("✓ MCP server %s eliminado", m.pendingName)
+				m.rebuildList()
+				m.step = stepMCPList
+				return m, nil
+			}
+		}
+	}
+
+	if m.step == stepMCPList {
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m *mcpServersEditor) View() string {
+	if m.err != nil {
+		return errorStyle.Render(fmt.Sprintf("Error: %v\n\nesc para volver", m.err))
+	}
+
+	switch m.step {
+	case stepMCPList:
+		body := m.list.View()
+		if len(m.list.Items()) == 0 {
+			body = dimStyle.Render("No hay MCP servers configurados.")
+		}
+		hint := dimStyle.Render(
+			"↑↓ moverse · a agregar · e editar · d eliminar · esc volver",
+		)
+		parts := []string{body}
+		if m.flash != "" {
+			parts = append(parts, lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#5FD6C4")).
+				Padding(0, 2).
+				Render(m.flash))
+		}
+		parts = append(parts, hint)
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	case stepMCPForm:
+		titleText := "Agregar MCP server"
+		if m.editingName != "" {
+			titleText = fmt.Sprintf("Editar MCP server (%s)", m.editingName)
+		}
+		title := titleStyle.Render(titleText)
+
+		labels := []string{"NAME", "COMMAND", "ARGS", "ENV"}
+		labels[m.focusIdx] = "▸ " + labels[m.focusIdx]
+		hints := []string{
+			"identificador del server (sin espacios). Ej: github",
+			"binario a ejecutar. Ej: npx, /usr/local/bin/foo",
+			"separados por espacio. Ej: -y @modelcontextprotocol/server-github",
+			"opcional. KEY1=VAL1 KEY2=VAL2",
+		}
+		inputs := []textinput.Model{m.nameInput, m.commandInput, m.argsInput, m.envInput}
+		blocks := make([]string, 0, len(labels))
+		for i, label := range labels {
+			block := lipgloss.JoinVertical(
+				lipgloss.Left,
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#F5B544")).Bold(true).Padding(0, 2).Render(label),
+				lipgloss.NewStyle().Padding(0, 2).Render(inputs[i].View()),
+				dimStyle.Render(hints[i]),
+			)
+			blocks = append(blocks, block)
+		}
+
+		parts := []string{title}
+		parts = append(parts, blocks...)
+		if m.formErr != "" {
+			parts = append(parts, errorStyle.Render(m.formErr))
+		}
+		parts = append(parts, dimStyle.Render("tab/shift+tab cambiar campo · ctrl+s guardar · esc cancelar"))
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	case stepMCPConfirmDel:
+		title := titleStyle.Render(fmt.Sprintf("Eliminar MCP server %s", m.pendingName))
+		warn := warnStyle.Render("Se hará backup de ~/.claude/settings.json antes de modificarlo.")
+		hint := dimStyle.Render("y para confirmar · esc para cancelar")
+		return lipgloss.JoinVertical(lipgloss.Left, title, warn, hint)
+	}
+	return ""
+}
+
+func (m *mcpServersEditor) openForm(name string, s mcpServer) {
+	m.nameInput = newFormInput(name, "github")
+	m.commandInput = newFormInput(s.Command, "npx")
+	m.argsInput = newFormInput(strings.Join(s.Args, " "), "-y @modelcontextprotocol/server-github")
+	m.envInput = newFormInput(formatEnvLine(s.Env), "GITHUB_TOKEN=ghp_xxx")
+	m.nameInput.Focus()
+	m.focusIdx = 0
+	m.formErr = ""
+	m.editingName = name
+	m.originalName = name
+	m.step = stepMCPForm
+}
+
+func (m *mcpServersEditor) closeForm() {
+	m.nameInput.Blur()
+	m.commandInput.Blur()
+	m.argsInput.Blur()
+	m.envInput.Blur()
+	m.formErr = ""
+	m.editingName = ""
+	m.originalName = ""
+	m.step = stepMCPList
+}
+
+// cycleFocus mueve el foco entre los 4 inputs en forma circular.
+func (m *mcpServersEditor) cycleFocus(delta int) {
+	inputs := []*textinput.Model{&m.nameInput, &m.commandInput, &m.argsInput, &m.envInput}
+	inputs[m.focusIdx].Blur()
+	m.focusIdx = (m.focusIdx + delta + len(inputs)) % len(inputs)
+	inputs[m.focusIdx].Focus()
+}
+
+func (m *mcpServersEditor) saveForm() error {
+	name := strings.TrimSpace(m.nameInput.Value())
+	cmd := strings.TrimSpace(m.commandInput.Value())
+	if name == "" {
+		return fmt.Errorf("el nombre no puede estar vacío")
+	}
+	if strings.ContainsAny(name, " \t\n\r") {
+		return fmt.Errorf("el nombre no puede contener espacios")
+	}
+	if cmd == "" {
+		return fmt.Errorf("el command no puede estar vacío")
+	}
+
+	args := splitArgs(m.argsInput.Value())
+	env, err := parseEnvLine(m.envInput.Value())
+	if err != nil {
+		return err
+	}
+
+	servers := getMCPServers(m.settings)
+	// Si renombró hacia uno existente, abortar.
+	if _, exists := servers[name]; exists && name != m.originalName {
+		return fmt.Errorf("ya existe un server llamado %s", name)
+	}
+	// Renombre: borrar el viejo.
+	if m.originalName != "" && m.originalName != name {
+		delete(servers, m.originalName)
+	}
+	servers[name] = mcpServer{
+		Command: cmd,
+		Args:    args,
+		Env:     env,
+	}
+	return saveMCPServers(m.settings, servers)
+}
+
+func (m *mcpServersEditor) deleteCurrent() error {
+	servers := getMCPServers(m.settings)
+	delete(servers, m.pendingName)
+	return saveMCPServers(m.settings, servers)
+}
+
+// splitArgs parte el string por whitespace. No soporta quoting (los args con
+// espacios no son representables en este formato simple — para casos así, el
+// usuario puede editar settings.json a mano).
+func splitArgs(raw string) []string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return nil
+	}
+	return fields
+}
+
+// parseEnvLine parsea "KEY1=VAL1 KEY2=VAL2" a un map. Tolera vacío. Falla si
+// algún token no contiene '='.
+func parseEnvLine(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, tok := range strings.Fields(raw) {
+		idx := strings.IndexByte(tok, '=')
+		if idx <= 0 {
+			return nil, fmt.Errorf("ENV mal formado: %q (esperado KEY=VALUE)", tok)
+		}
+		k := tok[:idx]
+		v := tok[idx+1:]
+		if err := validateEnvKey(k); err != nil {
+			return nil, fmt.Errorf("ENV: %w", err)
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// formatEnvLine arma "K1=V1 K2=V2" para precarga del input al editar.
+func formatEnvLine(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	keys := sortedKeys(env)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+env[k])
+	}
+	return strings.Join(parts, " ")
+}
+
+// sortStrings ordena en place. Wrapper para no importar sort sólo por esto.
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
