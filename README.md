@@ -13,6 +13,8 @@ El script detecta tu OS/arquitectura, baja el binario de la última release
 de GitHub y lo coloca en `~/.local/bin`. Asegurate de tener ese path en tu
 `$PATH`.
 
+Landing para compartir: https://cognidevai.github.io/monocle/
+
 ### Otras formas
 
 Build local (requiere Go 1.22+):

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Monocle — TUI para configurar Claude Code</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Monocle es un TUI en Go para configurar Claude Code sin editar JSON a mano: statusline, hooks, settings y updates.">
+  <meta property="og:title" content="Monocle — TUI para configurar Claude Code">
+  <meta property="og:description" content="Editá statusline, hooks y settings de Claude Code desde una interfaz terminal prolija.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://cognidevai.github.io/monocle/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Monocle — TUI para configurar Claude Code">
+  <meta name="twitter:description" content="Instalalo en un comando y configurá Claude Code sin tocar JSON a mano.">
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: rgba(20, 24, 33, 0.88);
+      --panel-border: rgba(255, 255, 255, 0.08);
+      --text: #e6e8ec;
+      --muted: #9aa4b2;
+      --accent: #f5b544;
+      --accent-2: #5fd6c4;
+      --shadow: 0 30px 80px rgba(0, 0, 0, 0.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(245, 181, 68, 0.12), transparent 24%),
+        radial-gradient(circle at bottom right, rgba(95, 214, 196, 0.12), transparent 22%),
+        var(--bg);
+      min-height: 100vh;
+    }
+    .wrap {
+      width: min(1100px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 72px 0;
+    }
+    .hero {
+      display: grid;
+      gap: 24px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      align-items: center;
+    }
+    .badge {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--panel-border);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 600;
+    }
+    h1 {
+      margin: 16px 0 12px;
+      font-size: clamp(40px, 7vw, 72px);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.7;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 13px 18px;
+      border-radius: 12px;
+      text-decoration: none;
+      font-weight: 700;
+      transition: transform 160ms ease, opacity 160ms ease;
+    }
+    .button:hover { transform: translateY(-1px); }
+    .button.primary { background: var(--accent); color: #151107; }
+    .button.secondary {
+      border: 1px solid var(--panel-border);
+      color: var(--text);
+      background: rgba(255,255,255,0.03);
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 24px;
+      padding: 24px;
+      backdrop-filter: blur(18px);
+      box-shadow: var(--shadow);
+    }
+    .terminal {
+      overflow: hidden;
+      padding: 0;
+    }
+    .terminal-bar {
+      display: flex;
+      gap: 8px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--panel-border);
+      background: rgba(255,255,255,0.03);
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.2);
+    }
+    pre {
+      margin: 0;
+      padding: 22px;
+      overflow-x: auto;
+      color: var(--accent-2);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+    code { font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace; }
+    .section {
+      margin-top: 28px;
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .card h2 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+    .card p { font-size: 15px; }
+    .install {
+      margin-top: 28px;
+    }
+    .install h2, .share h2 {
+      margin: 0 0 12px;
+      font-size: 24px;
+    }
+    .muted { color: var(--muted); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div>
+        <span class="badge">Monocle · Go + Bubble Tea</span>
+        <h1>Configurá Claude Code sin pelearte con JSON.</h1>
+        <p>Monocle es un TUI para editar <code>~/.claude/settings.json</code> con backup automático, presets de statusline, gestión de hooks, settings avanzados y update desde terminal.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/CogniDevAI/monocle">Ver en GitHub</a>
+          <a class="button secondary" href="#instalacion">Instalar ahora</a>
+        </div>
+      </div>
+
+      <div class="panel terminal" aria-label="Installer command">
+        <div class="terminal-bar">
+          <span class="dot"></span>
+          <span class="dot"></span>
+          <span class="dot"></span>
+        </div>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/CogniDevAI/monocle/main/install.sh | sh
+
+monocle</code></pre>
+      </div>
+    </section>
+
+    <section class="section" aria-label="Features principales">
+      <article class="panel card">
+        <h2>Statusline visual</h2>
+        <p>Elegí presets o armá una statusline custom por segmentos, sin escribir scripts bash a mano.</p>
+      </article>
+      <article class="panel card">
+        <h2>Hooks y settings</h2>
+        <p>Gestioná hooks, permissions, output style, modelo, variables de entorno y servidores MCP desde una UI consistente.</p>
+      </article>
+      <article class="panel card">
+        <h2>Seguro y actualizable</h2>
+        <p>Hace backup antes de escribir, detecta updates en GitHub y permite actualizar con <code>monocle update</code>.</p>
+      </article>
+    </section>
+
+    <section class="panel install" id="instalacion">
+      <h2>Instalación</h2>
+      <p class="muted">Un solo comando. Sin duplicar installers, sin inventar flujos raros.</p>
+      <pre><code>curl -fsSL https://raw.githubusercontent.com/CogniDevAI/monocle/main/install.sh | sh</code></pre>
+      <p class="muted">El script detecta OS y arquitectura, descarga la última release y deja el binario en <code>~/.local/bin</code>.</p>
+    </section>
+
+    <section class="panel share">
+      <h2>Para compartir</h2>
+      <p>Landing pública: <a href="https://cognidevai.github.io/monocle/">cognidevai.github.io/monocle</a></p>
+      <p class="muted">Ideal para X y LinkedIn: explica el producto y mantiene el installer canónico apuntando al <code>install.sh</code> del root.</p>
+    </section>
+  </div>
+</body>
+</html>
