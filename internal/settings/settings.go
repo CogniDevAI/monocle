@@ -8,8 +8,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 )
+
+// MaxBackups es la cantidad máxima de backups timestamped que se conservan
+// por archivo. Cuando Save() crea uno nuevo y la cuenta total supera este
+// número, se eliminan los más viejos.
+const MaxBackups = 10
 
 // Settings es el contenido completo de settings.json como mapa flexible.
 // Mantenerlo como map[string]any preserva campos desconocidos al reescribir.
@@ -53,27 +60,45 @@ func (s *Settings) Path() string { return s.path }
 // Get devuelve el valor de la clave top-level (o nil si no existe).
 func (s *Settings) Get(key string) any { return s.data[key] }
 
-// Set sobrescribe la clave top-level.
-func (s *Settings) Set(key string, value any) { s.data[key] = value }
+// Set sobrescribe la clave top-level. Una key vacía se ignora silenciosamente
+// para evitar entradas raras como `"": "x"` en el JSON.
+func (s *Settings) Set(key string, value any) {
+	if key == "" {
+		return
+	}
+	s.data[key] = value
+}
 
 // Save escribe el JSON con backup. Crea el directorio si hace falta.
-// El backup queda en <path>.bak.<timestamp>.
+//
+// Orden de operaciones (importa para no dejar archivos huérfanos ni
+// backups inútiles):
+//  1. MarshalIndent — si falla acá, no se tocó nada en disco todavía.
+//  2. Si ya existe el archivo: backup timestamped en <path>.bak.<ts>.
+//  3. Rotación: borrar backups más viejos si la cuenta supera MaxBackups.
+//  4. Escribir <path>.tmp y rename atómico → <path>.
+//     Si el rename falla, se borra el .tmp para no dejar basura.
 func (s *Settings) Save() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
 
+	out, err := json.MarshalIndent(s.data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
 	if _, err := os.Stat(s.path); err == nil {
-		ts := time.Now().Format("20060102-150405")
+		ts := time.Now().Format("20060102-150405.000000")
 		backup := s.path + ".bak." + ts
 		if err := copyFile(s.path, backup); err != nil {
 			return fmt.Errorf("backup: %w", err)
 		}
-	}
-
-	out, err := json.MarshalIndent(s.data, "", "  ")
-	if err != nil {
-		return err
+		if err := pruneBackups(s.path, MaxBackups); err != nil {
+			// Pruning failure no debe abortar el save — el dato está a salvo.
+			// Lo dejamos pasar silencioso; podríamos loggear si tuviéramos logger.
+			_ = err
+		}
 	}
 
 	tmp := s.path + ".tmp"
@@ -81,7 +106,43 @@ func (s *Settings) Save() error {
 		return err
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
+		// Si el rename falla, no dejamos el .tmp colgando.
+		_ = os.Remove(tmp)
 		return fmt.Errorf("rename %s -> %s: %w", tmp, s.path, err)
+	}
+	return nil
+}
+
+// pruneBackups borra los backups más viejos si hay más de keep. Compara por
+// nombre (orden lexicográfico ≈ orden temporal por el formato del timestamp).
+func pruneBackups(path string, keep int) error {
+	dir := filepath.Dir(path)
+	prefix := filepath.Base(path) + ".bak."
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	var backups []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), prefix) {
+			backups = append(backups, e.Name())
+		}
+	}
+
+	if len(backups) <= keep {
+		return nil
+	}
+
+	// Orden ascendente: el primero es el más viejo.
+	sort.Strings(backups)
+	toDelete := backups[:len(backups)-keep]
+	for _, name := range toDelete {
+		_ = os.Remove(filepath.Join(dir, name))
 	}
 	return nil
 }

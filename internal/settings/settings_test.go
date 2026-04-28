@@ -319,6 +319,76 @@ func TestSetStatusLineCommand(t *testing.T) {
 	}
 }
 
+func TestSet_IgnoresEmptyKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s.Set("", "no-debería-entrar")
+
+	if got := s.Get(""); got != nil {
+		t.Errorf("Set con key vacía no debe registrar el valor, got %v", got)
+	}
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("leyendo settings tras save: %v", err)
+	}
+	if strings.Contains(string(raw), `""`) && strings.Contains(string(raw), "no-debería-entrar") {
+		t.Errorf("settings.json contiene la entry con key vacía: %s", raw)
+	}
+}
+
+func TestSave_RotatesOldBackups(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	// Sembrar el archivo + (MaxBackups + 3) backups antiguos con timestamps
+	// crecientes para que el de menor lex sea el más viejo.
+	writeJSON(t, path, map[string]any{"k": "v"})
+	excess := 3
+	for i := 0; i < MaxBackups+excess; i++ {
+		fake := path + ".bak.20200101-00000" + string(rune('0'+i%10))
+		if err := os.WriteFile(fake, []byte("{}"), 0o644); err != nil {
+			t.Fatalf("seed backup %d: %v", i, err)
+		}
+	}
+
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s.Set("k", "v2")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Tras el Save debe haber 1 backup nuevo + se borraron los excedentes.
+	// Total esperado ≈ MaxBackups (los más nuevos sobreviven).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	count := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "settings.json.bak.") {
+			count++
+		}
+	}
+	if count > MaxBackups {
+		t.Errorf("rotación falló: hay %d backups, máximo %d", count, MaxBackups)
+	}
+	if count < 1 {
+		t.Errorf("se borraron todos los backups, debería quedar al menos el nuevo")
+	}
+}
+
 func TestDefaultPath_ContainsClaudeSettings(t *testing.T) {
 	p, err := DefaultPath()
 	if err != nil {

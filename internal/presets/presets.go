@@ -46,10 +46,15 @@ func All() []Preset {
 }
 
 // FindByID busca un preset por su ID (case-sensitive). Retorna nil si no existe.
+//
+// Iteramos por índice y devolvemos &all[i] (no &p del iterador) para que el
+// puntero apunte al elemento del slice, no a una copia local que se reusa.
+// Es seguro en Go 1.22+, pero esta forma es robusta a refactors futuros.
 func FindByID(id string) *Preset {
-	for _, p := range All() {
-		if p.ID == id {
-			return &p
+	all := All()
+	for i := range all {
+		if all[i].ID == id {
+			return &all[i]
 		}
 	}
 	return nil
